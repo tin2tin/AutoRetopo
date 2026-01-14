@@ -1,5 +1,5 @@
 # AutoRetopo
-Just a simple retopolgy and re-texturing tool that is suited for high poly meshes (photogrametry, AI generated 3D models etc). 
+A simple retopolgy and re-texturing tool that is suited for high poly meshes (photogrametry, AI generated 3D models etc). 
 The output is a duplicate of the selected mesh will a lower polycount and with quad faces, with a new UV map and textures.
 
 
