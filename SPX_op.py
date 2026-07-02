@@ -136,7 +136,7 @@ class SPX_OT_Apply_All_Op(Operator):
                 bpy.context.view_layer.objects.active = bpy.data.objects[new_object_name]
 
                 #NORMAL
-                bpy.context.scene.render.use_bake_multires = True
+                bpy.context.scene.render.bake.use_multires = True
                 bpy.context.scene.cycles.tile_size = 512
                 bpy.context.scene.cycles.samples = 10
 
@@ -151,7 +151,7 @@ class SPX_OT_Apply_All_Op(Operator):
                 normal_image.save()
 
                 #DIFFUSE
-                bpy.context.scene.render.use_bake_multires = False
+                bpy.context.scene.render.bake.use_multires = False
                 bpy.context.scene.render.bake.use_pass_direct = False
                 bpy.context.scene.render.bake.use_pass_indirect = False
                 bpy.context.scene.render.bake.use_pass_color = True
@@ -183,5 +183,3 @@ class SPX_OT_Apply_All_Op(Operator):
 
         self.report({'INFO'}, "Remesh applied")
         return {'FINISHED'}
-    
-
