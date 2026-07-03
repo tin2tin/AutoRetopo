@@ -33,8 +33,8 @@ from . SPX_panel import SPX_PT_Panel
 
 bpy.types.Scene.voxel_size = bpy.props.FloatProperty(
     name="Voxel Detail",
-    description="Voxel remesh detail, as a fraction of the object's bounding box diagonal. Lower values preserve finer detail (more voxels, better at keeping thin gaps like between legs or fingers separate, and more faithful to the source proportions/silhouette); higher values are coarser and can round off those gaps, reading as a stockier/bulkier result. Scales automatically with object size",
-    default=0.001,
+    description="Voxel remesh detail, as a fraction of the object's bounding box diagonal. Lower values preserve finer detail (more voxels, better at keeping thin gaps like between legs or fingers separate, and more faithful to the source proportions/silhouette) but are more likely to produce geometry Quadriflow rejects, falling back to a triangulated Decimate result; higher values are coarser (can round off thin gaps, reading as stockier/bulkier) but remesh to clean quads more reliably. Scales automatically with object size",
+    default=0.005,
     min=0.0005,
     max=0.2,
     precision=4
@@ -56,10 +56,10 @@ bpy.types.Scene.quad_enabled = bpy.props.BoolProperty(
 
 bpy.types.Scene.face_number = bpy.props.IntProperty(
     name="Faces",
-    description="Number of faces for quad remeshing",
+    description="Target face count for quad remeshing, or for the Decimate fallback if Quadriflow rejects the mesh",
     default=1000,
     min=1,
-    max=50000
+    max=1000000
 )
 
 bpy.types.Scene.diffuse_texture = bpy.props.BoolProperty(

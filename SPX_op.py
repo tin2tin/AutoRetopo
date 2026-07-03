@@ -308,7 +308,24 @@ class SPX_OT_Apply_All_Op(Operator):
                     bpy.ops.mesh.normals_make_consistent(inside=False)
                     bpy.ops.object.mode_set(mode='OBJECT')
 
-                    # Apply quad remeshing if enabled
+                    def decimate_to_target():
+                        # A single Decimate pass rarely lands exactly on
+                        # target - its "ratio" is a request, not a
+                        # guarantee, since topology constraints (sharp
+                        # features, disconnected shells) can stop it from
+                        # collapsing as far as the ratio implies. Re-apply
+                        # with a recalculated ratio against the actual
+                        # result until it converges or stops improving.
+                        for _ in range(5):
+                            current_faces = len(new_object.data.polygons)
+                            if current_faces <= face_number:
+                                break
+                            decimate_mod = new_object.modifiers.new(name="AutoRetopoFallbackDecimate", type='DECIMATE')
+                            decimate_mod.ratio = face_number / current_faces
+                            bpy.ops.object.modifier_apply(modifier=decimate_mod.name)
+                            if len(new_object.data.polygons) >= current_faces:
+                                break
+
                     if quad_enabled:
                         self._report_progress(context, 0.4, "Quad remeshing...")
 
@@ -339,12 +356,14 @@ class SPX_OT_Apply_All_Op(Operator):
                             # low-poly result near their target face count,
                             # instead of the raw, much-higher-poly voxel mesh.
                             self._report_progress(context, 0.45, "Quad remeshing failed, decimating instead...")
-                            current_faces = len(new_object.data.polygons)
-                            if current_faces > face_number:
-                                decimate_mod = new_object.modifiers.new(name="AutoRetopoFallbackDecimate", type='DECIMATE')
-                                decimate_mod.ratio = face_number / current_faces
-                                bpy.ops.object.modifier_apply(modifier=decimate_mod.name)
+                            decimate_to_target()
                             self.report({'WARNING'}, "Quad remeshing failed on this mesh (non-manifold or inconsistent normals); used Decimate instead to still reach roughly the requested face count, so the result is triangulated rather than quads")
+                    else:
+                        # Quad remeshing off - go straight to Decimate
+                        # instead of leaving the mesh at the much-higher
+                        # raw voxel-remesh face count.
+                        self._report_progress(context, 0.4, "Decimating...")
+                        decimate_to_target()
 
                     # Final safety-net repair. Both Quadriflow and, more
                     # surprisingly, an aggressive Decimate fallback (millions
