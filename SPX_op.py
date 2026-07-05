@@ -133,33 +133,96 @@ def _remove_tiny_shells(mesh, min_relative_size=0.01):
     bm.free()
 
 
+# Voxel Detail is a fraction of the bounding box diagonal, so processing
+# at a different absolute scale is mathematically a no-op for the
+# voxel-remesh resolution itself. This exists because a few other steps
+# use a fixed absolute tolerance rather than one relative to object size
+# (repair's remove_doubles(threshold=0.0001), for instance) and behave
+# more predictably at a moderate absolute scale than at the extremes
+# real-world imports can land on.
+_PROCESSING_SCALE = 0.1
+
+
 class SPX_OT_Apply_All_Op(Operator):
     bl_idname = "object.vrt_remesh_op"
     bl_label = "Apply all"
     bl_description = "Apply all modifiers on the active object"
     bl_options = {'REGISTER', 'UNDO'}
 
+    _timer = None
+    _gen = None
+    _original_obj_name = ""
+
     @classmethod
     def poll(cls, context):
         return len(context.selected_objects) > 0
 
     def _report_progress(self, context, fraction, status):
-        """Update the panel's progress bar/status text and force an
-        immediate redraw. execute() runs as a single blocking call, so
-        without forcing a redraw here the UI wouldn't visibly update
-        until the whole operator finished."""
+        """Update the panel's progress bar/status text. Under the modal
+        timer, control returns to Blender's event loop between steps so
+        the UI redraws and stays responsive on its own; tag_redraw just
+        makes sure the panel picks up the new text/fraction on that next
+        pass rather than waiting for unrelated mouse-move redraws."""
         context.scene.retopo_progress = fraction
         context.scene.retopo_status = status
         print(f"[AutoRetopo] {status} ({fraction * 100:.0f}%)")
         if context.window:
             for area in context.screen.areas:
                 area.tag_redraw()
-            try:
-                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-            except Exception:
-                pass
 
-    def execute(self, context):
+    def _process(self, context):
+        """Generator form of the whole remesh/bake pipeline. Yields
+        after every progress checkpoint so the modal loop can hand
+        control back to Blender between steps instead of freezing the
+        UI for the entire operation - each bpy.ops call in between two
+        yields is still a single blocking native call (Blender doesn't
+        allow mesh operations off the main thread), but returning
+        between phases is what actually keeps the window responsive and
+        lets Cancel (Esc) take effect between them."""
+        scene = context.scene
+        bakeFolder = scene.bakeFolder
+
+        if bpy.context.space_data:
+            bpy.context.space_data.overlay.show_stats = True
+        bpy.context.scene.render.engine = 'CYCLES'
+
+        # Ensure the bake folder exists and is writable
+        if not os.path.exists(bakeFolder) or not os.access(bakeFolder, os.W_OK):
+            self.report({'WARNING'}, "Select a valid export folder!")
+            return
+
+        # Ensure path ends with the proper directory separator
+        if not bakeFolder.endswith(os.sep):
+            bakeFolder += os.sep
+
+        if not (context.active_object and context.active_object.type == 'MESH'):
+            self.report({'ERROR'}, "Active object is not a valid mesh.")
+            raise RuntimeError("Active object is not a valid mesh.")
+
+        self._report_progress(context, 0.0, "Preparing...")
+        yield
+        bpy.ops.object.shade_smooth()
+        original_obj = context.active_object
+        original_obj_name = original_obj.name
+        self._original_obj_name = original_obj_name
+
+        # Downscale the source mesh before any processing, and restore
+        # true scale on both it and the working copy at the very end -
+        # guaranteed by the try/finally below even on an error or a
+        # cancel (a generator's finally block runs whether it exits via
+        # normal completion, an exception, or being closed early).
+        _scale_mesh_verts(original_obj.data, _PROCESSING_SCALE)
+        self._new_object = None
+        try:
+            yield from self._process_at_scale(context, original_obj, original_obj_name, bakeFolder)
+        finally:
+            _scale_mesh_verts(original_obj.data, 1.0 / _PROCESSING_SCALE)
+            new_object = getattr(self, "_new_object", None)
+            if new_object is not None:
+                _scale_mesh_verts(new_object.data, 1.0 / _PROCESSING_SCALE)
+            self._new_object = None
+
+    def _process_at_scale(self, context, original_obj, original_obj_name, bakeFolder):
         scene = context.scene
         voxel_size = scene.voxel_size
         pre_smooth_iterations = scene.pre_smooth_iterations
@@ -168,362 +231,437 @@ class SPX_OT_Apply_All_Op(Operator):
         diffuse_enabled = scene.diffuse_texture
         normal_enabled = scene.normal_texture
         tex_size = scene.tex_size
-        bakeFolder = scene.bakeFolder
 
-        bpy.context.space_data.overlay.show_stats = True
-        bpy.context.scene.render.engine = 'CYCLES'
+        # Create a duplicate of the original object
+        bpy.ops.object.duplicate(linked=False)
+        new_object = context.active_object
+        new_object_name = new_object.name
+        self._new_object = new_object
 
-        # Ensure the bake folder exists and is writable
-        if not os.path.exists(bakeFolder) or not os.access(bakeFolder, os.W_OK):
-            self.report({'WARNING'}, "Select a valid export folder!")
-            return {'FINISHED'}
-        
-        # Ensure path ends with the proper directory separator
-        if not bakeFolder.endswith(os.sep):
-            bakeFolder += os.sep
-        
-        if context.active_object and context.active_object.type == 'MESH':
-            self._report_progress(context, 0.0, "Preparing...")
-            bpy.ops.object.shade_smooth()
-            original_obj = context.active_object
-            original_obj_name = original_obj.name
+        # Detect fragment-cloud geometry. AI-generated meshes
+        # (TRELLIS and similar image-to-3D models) are often not a
+        # continuous surface at all but hundreds of thousands of
+        # tiny overlapping open patches - only *looking* solid
+        # because the fragments tile the visible surface. Voxel
+        # remesh turns the gaps between such zero-thickness
+        # fragments into real holes ("swiss cheese"), and the
+        # island-merge below is both meaningless and extremely slow
+        # on that kind of input, so it is skipped in favor of
+        # solidifying before the voxel step.
+        self._report_progress(context, 0.08, "Analyzing mesh...")
+        yield
+        is_fragment_cloud = _open_edge_fraction(new_object.data) > 0.05
 
-            try:
-                # Create a duplicate of the original object
-                bpy.ops.object.duplicate(linked=False)
-                new_object = context.active_object
-                new_object_name = new_object.name
+        if not is_fragment_cloud:
+            # Clean up raw scan data before remeshing. Scan meshes
+            # often contain small disconnected floating fragments
+            # (holes from occlusion, hair, thin fabric edges).
+            # Nothing is deleted here - small islands are only
+            # repositioned (see _merge_small_islands), never
+            # removed.
+            self._report_progress(context, 0.12, "Merging small islands...")
+            yield
+            _merge_small_islands(new_object.data)
 
-                # Detect fragment-cloud geometry. AI-generated meshes
-                # (TRELLIS and similar image-to-3D models) are often not a
-                # continuous surface at all but hundreds of thousands of
-                # tiny overlapping open patches - only *looking* solid
-                # because the fragments tile the visible surface. Voxel
-                # remesh turns the gaps between such zero-thickness
-                # fragments into real holes ("swiss cheese"), and the
-                # island-merge below is both meaningless and extremely slow
-                # on that kind of input, so it is skipped in favor of
-                # solidifying before the voxel step.
-                self._report_progress(context, 0.08, "Analyzing mesh...")
-                is_fragment_cloud = _open_edge_fraction(new_object.data) > 0.05
+        # Optional pre-smooth, run before voxelizing. Voxel remesh
+        # faithfully resolves whatever amplitude of noise is present
+        # at its grid resolution, so a fine voxel size that's needed
+        # to preserve real thin gaps (legs, fingers) will just as
+        # faithfully turn chaotic scan noise (messy hair, overlapping
+        # debris) into shattered, shard-like geometry. Smoothing first
+        # damps that small-scale noise independently of voxel size.
+        if pre_smooth_iterations > 0:
+            self._report_progress(context, 0.16, "Pre-smoothing...")
+            yield
+            # Use the Smooth modifier (native code) rather than the
+            # mesh.vertices_smooth operator (Python, edit-mode). Its
+            # per-pass movement is bounded by local edge length, so
+            # on a dense multi-million-vertex scan the operator loop
+            # needs a huge iteration count to move points a visually
+            # meaningful distance - and running that many iterations
+            # through the operator is far too slow to be practical.
+            # The modifier does the same underlying algorithm but is
+            # orders of magnitude faster, making that iteration count
+            # actually reachable.
+            smooth_mod = new_object.modifiers.new(name="AutoRetopoPreSmooth", type='SMOOTH')
+            smooth_mod.factor = 0.5
+            smooth_mod.iterations = pre_smooth_iterations
+            bpy.ops.object.modifier_apply(modifier=smooth_mod.name)
 
-                if not is_fragment_cloud:
-                    # Clean up raw scan data before remeshing. Scan meshes
-                    # often contain small disconnected floating fragments
-                    # (holes from occlusion, hair, thin fabric edges).
-                    # Nothing is deleted here - small islands are only
-                    # repositioned (see _merge_small_islands), never
-                    # removed.
-                    self._report_progress(context, 0.12, "Merging small islands...")
-                    _merge_small_islands(new_object.data)
+        # Apply Voxel Remesh
+        # voxel_size is a fraction of the bounding box diagonal, so the
+        # actual voxel resolution scales with the object instead of
+        # using a fixed absolute size that may be far too coarse (or
+        # fine) depending on the object's real-world scale.
+        if voxel_size > 0:
+            bbox_diagonal = new_object.dimensions.length
+            actual_voxel_size = max(bbox_diagonal * voxel_size, 0.0001)
 
-                # Optional pre-smooth, run before voxelizing. Voxel remesh
-                # faithfully resolves whatever amplitude of noise is present
-                # at its grid resolution, so a fine voxel size that's needed
-                # to preserve real thin gaps (legs, fingers) will just as
-                # faithfully turn chaotic scan noise (messy hair, overlapping
-                # debris) into shattered, shard-like geometry. Smoothing first
-                # damps that small-scale noise independently of voxel size.
-                if pre_smooth_iterations > 0:
-                    self._report_progress(context, 0.16, "Pre-smoothing...")
-                    # Use the Smooth modifier (native code) rather than the
-                    # mesh.vertices_smooth operator (Python, edit-mode). Its
-                    # per-pass movement is bounded by local edge length, so
-                    # on a dense multi-million-vertex scan the operator loop
-                    # needs a huge iteration count to move points a visually
-                    # meaningful distance - and running that many iterations
-                    # through the operator is far too slow to be practical.
-                    # The modifier does the same underlying algorithm but is
-                    # orders of magnitude faster, making that iteration count
-                    # actually reachable.
-                    smooth_mod = new_object.modifiers.new(name="AutoRetopoPreSmooth", type='SMOOTH')
-                    smooth_mod.factor = 0.5
-                    smooth_mod.iterations = pre_smooth_iterations
-                    bpy.ops.object.modifier_apply(modifier=smooth_mod.name)
+            # Fragment clouds (and any largely-open thin-shell
+            # geometry) must be given real thickness before voxel
+            # remeshing: with thickness comfortably above the voxel
+            # size, the overlapping fragment slabs union into one
+            # continuous solid instead of a shell full of holes
+            # wherever fragments meet. Verified on real TRELLIS
+            # output: genus drops from ~539 (riddled with holes)
+            # to ~3 (clean solid).
+            if is_fragment_cloud:
+                self._report_progress(context, 0.16, "Solidifying open surface...")
+                yield
+                solid_mod = new_object.modifiers.new(name="AutoRetopoSolidify", type='SOLIDIFY')
+                solid_mod.thickness = actual_voxel_size * 2.0
+                solid_mod.offset = 0.0
+                bpy.ops.object.modifier_apply(modifier=solid_mod.name)
 
-                # Apply Voxel Remesh
-                # voxel_size is a fraction of the bounding box diagonal, so the
-                # actual voxel resolution scales with the object instead of
-                # using a fixed absolute size that may be far too coarse (or
-                # fine) depending on the object's real-world scale.
-                if voxel_size > 0:
-                    bbox_diagonal = new_object.dimensions.length
-                    actual_voxel_size = max(bbox_diagonal * voxel_size, 0.0001)
+            self._report_progress(context, 0.2, "Voxel remeshing...")
+            yield
+            new_object.data.remesh_voxel_size = actual_voxel_size
+            bpy.ops.object.voxel_remesh()
 
-                    # Fragment clouds (and any largely-open thin-shell
-                    # geometry) must be given real thickness before voxel
-                    # remeshing: with thickness comfortably above the voxel
-                    # size, the overlapping fragment slabs union into one
-                    # continuous solid instead of a shell full of holes
-                    # wherever fragments meet. Verified on real TRELLIS
-                    # output: genus drops from ~539 (riddled with holes)
-                    # to ~3 (clean solid).
-                    if is_fragment_cloud:
-                        self._report_progress(context, 0.16, "Solidifying open surface...")
-                        solid_mod = new_object.modifiers.new(name="AutoRetopoSolidify", type='SOLIDIFY')
-                        solid_mod.thickness = actual_voxel_size * 2.0
-                        solid_mod.offset = 0.0
-                        bpy.ops.object.modifier_apply(modifier=solid_mod.name)
+            # Drop tiny floating blobs the voxel remesh generated
+            # from isolated fragment clusters (artifacts of the
+            # *generated* mesh; the source object is untouched).
+            self._report_progress(context, 0.32, "Removing remesh artifacts...")
+            yield
+            _remove_tiny_shells(new_object.data)
 
-                    self._report_progress(context, 0.2, "Voxel remeshing...")
-                    new_object.data.remesh_voxel_size = actual_voxel_size
-                    bpy.ops.object.voxel_remesh()
+            # Voxel remesh is supposed to always produce a clean,
+            # watertight manifold mesh, but on pathological input
+            # (extremely thin/noisy surfaces near the voxel grid's
+            # resolution limit) it can occasionally leave small
+            # non-manifold holes or inconsistent normals of its own.
+            # Quadriflow requires clean manifold input to run at
+            # all, so repair this *before* Quadriflow rather than
+            # after - patching it afterward was too late, since
+            # Quadriflow had already rejected the broken input and
+            # left the raw, much-higher-poly voxel result in place.
+            self._report_progress(context, 0.35, "Repairing mesh...")
+            yield
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.normals_make_consistent(inside=False)
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_non_manifold()
+            bpy.ops.mesh.fill_holes(sides=0)
 
-                    # Drop tiny floating blobs the voxel remesh generated
-                    # from isolated fragment clusters (artifacts of the
-                    # *generated* mesh; the source object is untouched).
-                    self._report_progress(context, 0.32, "Removing remesh artifacts...")
-                    _remove_tiny_shells(new_object.data)
+            # fill_holes only patches genuine boundary gaps (edges
+            # with 1 linked face). It doesn't fix "extra" non-manifold
+            # edges (3+ linked faces), which typically come from a
+            # handful of near-duplicate/overlapping faces left by
+            # voxel remesh on pathological input. Merge just those
+            # remaining non-manifold vertices by distance to weld
+            # the duplicates, then recalculate normals once more
+            # since fill_holes' new faces can be backwards-facing.
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_non_manifold()
+            bpy.ops.mesh.remove_doubles(threshold=0.0001, use_unselected=False)
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.normals_make_consistent(inside=False)
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-                    # Voxel remesh is supposed to always produce a clean,
-                    # watertight manifold mesh, but on pathological input
-                    # (extremely thin/noisy surfaces near the voxel grid's
-                    # resolution limit) it can occasionally leave small
-                    # non-manifold holes or inconsistent normals of its own.
-                    # Quadriflow requires clean manifold input to run at
-                    # all, so repair this *before* Quadriflow rather than
-                    # after - patching it afterward was too late, since
-                    # Quadriflow had already rejected the broken input and
-                    # left the raw, much-higher-poly voxel result in place.
-                    self._report_progress(context, 0.35, "Repairing mesh...")
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.normals_make_consistent(inside=False)
-                    bpy.ops.mesh.select_all(action='DESELECT')
-                    bpy.ops.mesh.select_non_manifold()
-                    bpy.ops.mesh.fill_holes(sides=0)
+            def decimate_to_target():
+                # A single Decimate pass rarely lands exactly on
+                # target - its "ratio" is a request, not a
+                # guarantee, since topology constraints (sharp
+                # features, disconnected shells) can stop it from
+                # collapsing as far as the ratio implies. Re-apply
+                # with a recalculated ratio against the actual
+                # result until it converges or stops improving.
+                for _ in range(5):
+                    current_faces = len(new_object.data.polygons)
+                    if current_faces <= face_number:
+                        break
+                    decimate_mod = new_object.modifiers.new(name="AutoRetopoFallbackDecimate", type='DECIMATE')
+                    decimate_mod.ratio = face_number / current_faces
+                    bpy.ops.object.modifier_apply(modifier=decimate_mod.name)
+                    if len(new_object.data.polygons) >= current_faces:
+                        break
 
-                    # fill_holes only patches genuine boundary gaps (edges
-                    # with 1 linked face). It doesn't fix "extra" non-manifold
-                    # edges (3+ linked faces), which typically come from a
-                    # handful of near-duplicate/overlapping faces left by
-                    # voxel remesh on pathological input. Merge just those
-                    # remaining non-manifold vertices by distance to weld
-                    # the duplicates, then recalculate normals once more
-                    # since fill_holes' new faces can be backwards-facing.
-                    bpy.ops.mesh.select_all(action='DESELECT')
-                    bpy.ops.mesh.select_non_manifold()
-                    bpy.ops.mesh.remove_doubles(threshold=0.0001, use_unselected=False)
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.normals_make_consistent(inside=False)
-                    bpy.ops.object.mode_set(mode='OBJECT')
+            if quad_enabled and is_fragment_cloud:
+                # Quadriflow is not just unreliable but actively
+                # untrustworthy on fragment-cloud (AI-generated)
+                # sources: verified on the real asset that it can
+                # report FINISHED while silently producing a
+                # deformed result, whereas the *same* mesh at a
+                # scale where Quadriflow fails outright and falls
+                # back to Decimate comes out correctly formed. A
+                # graceful failure is fine to fall back from; a
+                # false "success" is not something to build a
+                # fallback around, so skip the attempt entirely.
+                self._report_progress(context, 0.4, "Decimating (quad remeshing skipped - unreliable on this source)...")
+                yield
+                decimate_to_target()
+            elif quad_enabled:
+                self._report_progress(context, 0.4, "Quad remeshing...")
+                yield
 
-                    def decimate_to_target():
-                        # A single Decimate pass rarely lands exactly on
-                        # target - its "ratio" is a request, not a
-                        # guarantee, since topology constraints (sharp
-                        # features, disconnected shells) can stop it from
-                        # collapsing as far as the ratio implies. Re-apply
-                        # with a recalculated ratio against the actual
-                        # result until it converges or stops improving.
-                        for _ in range(5):
-                            current_faces = len(new_object.data.polygons)
-                            if current_faces <= face_number:
-                                break
-                            decimate_mod = new_object.modifiers.new(name="AutoRetopoFallbackDecimate", type='DECIMATE')
-                            decimate_mod.ratio = face_number / current_faces
-                            bpy.ops.object.modifier_apply(modifier=decimate_mod.name)
-                            if len(new_object.data.polygons) >= current_faces:
-                                break
+                # Blender's Quadriflow silently treats edges below
+                # roughly 0.01 absolute units as degenerate and
+                # rejects the whole mesh with a misleading
+                # "non-manifold" error. A 1-unit-tall character
+                # remeshed at fine voxel detail sits permanently
+                # below that threshold, so temporarily scale the
+                # mesh data up for the call and back down after.
+                # Verified on real TRELLIS output: identical mesh
+                # fails at 1x and produces clean quads at 10x.
+                quad_scale = max(1.0, 0.05 / actual_voxel_size)
+                if quad_scale > 1.0:
+                    _scale_mesh_verts(new_object.data, quad_scale)
 
-                    if quad_enabled:
-                        self._report_progress(context, 0.4, "Quad remeshing...")
+                quad_result = bpy.ops.object.quadriflow_remesh(target_faces=face_number)
 
-                        # Blender's Quadriflow silently treats edges below
-                        # roughly 0.01 absolute units as degenerate and
-                        # rejects the whole mesh with a misleading
-                        # "non-manifold" error. A 1-unit-tall character
-                        # remeshed at fine voxel detail sits permanently
-                        # below that threshold, so temporarily scale the
-                        # mesh data up for the call and back down after.
-                        # Verified on real TRELLIS output: identical mesh
-                        # fails at 1x and produces clean quads at 10x.
-                        quad_scale = max(1.0, 0.05 / actual_voxel_size)
-                        if quad_scale > 1.0:
-                            _scale_mesh_verts(new_object.data, quad_scale)
+                if quad_scale > 1.0:
+                    _scale_mesh_verts(new_object.data, 1.0 / quad_scale)
 
-                        quad_result = bpy.ops.object.quadriflow_remesh(target_faces=face_number)
+                if 'FINISHED' not in quad_result:
+                    # Even with all of the above, Quadriflow can
+                    # still reject certain topology - a robustness
+                    # limitation of its field-based algorithm, not
+                    # something further cleanup reliably fixes. Fall
+                    # back to Decimate so the user still gets a
+                    # low-poly result near their target face count,
+                    # instead of the raw, much-higher-poly voxel mesh.
+                    self._report_progress(context, 0.45, "Quad remeshing failed, decimating instead...")
+                    yield
+                    decimate_to_target()
+                    self.report({'WARNING'}, "Quad remeshing failed on this mesh (non-manifold or inconsistent normals); used Decimate instead to still reach roughly the requested face count, so the result is triangulated rather than quads")
+            else:
+                # Quad remeshing off - go straight to Decimate
+                # instead of leaving the mesh at the much-higher
+                # raw voxel-remesh face count.
+                self._report_progress(context, 0.4, "Decimating...")
+                yield
+                decimate_to_target()
 
-                        if quad_scale > 1.0:
-                            _scale_mesh_verts(new_object.data, 1.0 / quad_scale)
+            # Final safety-net repair. Both Quadriflow and, more
+            # surprisingly, an aggressive Decimate fallback (millions
+            # of faces collapsed down to the target count is a very
+            # severe reduction ratio) can occasionally tear open
+            # small holes even when their input was clean. Catch
+            # whatever is left right before UV unwrapping/baking,
+            # since that's what actually shows up as see-through
+            # holes in the final result.
+            self._report_progress(context, 0.5, "Final hole check...")
+            yield
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='DESELECT')
+            bpy.ops.mesh.select_non_manifold()
+            bpy.ops.mesh.fill_holes(sides=0)
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.normals_make_consistent(inside=False)
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-                        if 'FINISHED' not in quad_result:
-                            # Even with all of the above, Quadriflow can
-                            # still reject certain topology - a robustness
-                            # limitation of its field-based algorithm, not
-                            # something further cleanup reliably fixes. Fall
-                            # back to Decimate so the user still gets a
-                            # low-poly result near their target face count,
-                            # instead of the raw, much-higher-poly voxel mesh.
-                            self._report_progress(context, 0.45, "Quad remeshing failed, decimating instead...")
-                            decimate_to_target()
-                            self.report({'WARNING'}, "Quad remeshing failed on this mesh (non-manifold or inconsistent normals); used Decimate instead to still reach roughly the requested face count, so the result is triangulated rather than quads")
-                    else:
-                        # Quad remeshing off - go straight to Decimate
-                        # instead of leaving the mesh at the much-higher
-                        # raw voxel-remesh face count.
-                        self._report_progress(context, 0.4, "Decimating...")
-                        decimate_to_target()
+        bpy.ops.object.shade_smooth()
 
-                    # Final safety-net repair. Both Quadriflow and, more
-                    # surprisingly, an aggressive Decimate fallback (millions
-                    # of faces collapsed down to the target count is a very
-                    # severe reduction ratio) can occasionally tear open
-                    # small holes even when their input was clean. Catch
-                    # whatever is left right before UV unwrapping/baking,
-                    # since that's what actually shows up as see-through
-                    # holes in the final result.
-                    self._report_progress(context, 0.5, "Final hole check...")
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    bpy.ops.mesh.select_all(action='DESELECT')
-                    bpy.ops.mesh.select_non_manifold()
-                    bpy.ops.mesh.fill_holes(sides=0)
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    bpy.ops.mesh.normals_make_consistent(inside=False)
-                    bpy.ops.object.mode_set(mode='OBJECT')
+        # UV unwrapping the low-poly mesh
+        self._report_progress(context, 0.55, "UV unwrapping...")
+        yield
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.uv.smart_project(scale_to_bounds=True)
+        bpy.ops.object.mode_set(mode='OBJECT')
 
-                bpy.ops.object.shade_smooth()
-
-                # UV unwrapping the low-poly mesh
-                self._report_progress(context, 0.55, "UV unwrapping...")
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
-                bpy.ops.uv.smart_project(scale_to_bounds=True)
-                bpy.ops.object.mode_set(mode='OBJECT')
-
-                # Creating the new target material. Start from a copy of
-                # the original mesh's material rather than a blank one, so
-                # settings the bake doesn't cover (Roughness, Metallic,
-                # Specular, Emission, any extra texture maps) carry over
-                # instead of resetting to Blender's defaults. Base Color
-                # and Normal get overridden below with the freshly baked
-                # textures, since those need to match the new UV layout.
-                self._report_progress(context, 0.6, "Setting up material...")
-                original_material = original_obj.data.materials[0] if original_obj.data.materials else None
-                if original_material:
-                    material = original_material.copy()
-                    material.name = f"{new_object_name}_Mat"
-                    if not material.use_nodes:
-                        material.use_nodes = True
-                else:
-                    material = bpy.data.materials.new(name=f"{new_object_name}_Mat")
-                    material.use_nodes = True
-                nodes = material.node_tree.nodes
-                links = material.node_tree.links
-                bsdf_node = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
-                
-                diffuse_node = None
-                normal_texture_node = None
-                norm_map = None
-
-                # Setup nodes based on settings
-                if bsdf_node:
-                    if diffuse_enabled:  
-                        diffuse_image_name = f"{new_object_name}_Diffuse"
-                        diffuse_image = bpy.data.images.new(name=diffuse_image_name, width=tex_size, height=tex_size, alpha=True)
-                        diffuse_node = nodes.new(type='ShaderNodeTexImage')
-                        diffuse_node.image = diffuse_image
-                        diffuse_node.location = (-400, 400)
-                        
-                    if normal_enabled:
-                        normal_image_name = f"{new_object_name}_Normal"
-                        normal_image = bpy.data.images.new(name=normal_image_name, width=tex_size, height=tex_size, alpha=False, float_buffer=True)
-                        normal_image.colorspace_settings.name = 'Non-Color'
-                        normal_texture_node = nodes.new(type='ShaderNodeTexImage')
-                        normal_texture_node.image = normal_image
-                        normal_texture_node.interpolation = 'Closest'
-                        normal_texture_node.location = (-400, 200)
-
-                        norm_map = nodes.new('ShaderNodeNormalMap') 
-                        norm_map.location = (-100, 0)
-                        
-                # Assign the material to the low-poly object
-                if len(new_object.data.materials) > 0:
-                    new_object.data.materials[0] = material
-                else:
-                    new_object.data.materials.append(material)
-
-                # Set up Selected-to-Active baking selections
-                bpy.ops.object.select_all(action='DESELECT')
-                bpy.data.objects[original_obj_name].select_set(True)  # Select source high-poly (Selected)
-                bpy.data.objects[new_object_name].select_set(True)     # Select target low-poly (Active)
-                bpy.context.view_layer.objects.active = bpy.data.objects[new_object_name]
-
-                # Common Bake Engine Settings
-                bpy.context.scene.render.bake.use_multires = False
-                bpy.context.scene.cycles.tile_size = 512
-                bpy.context.scene.cycles.samples = 10
-
-                # Cage extrusion must scale with the object: a fixed 0.15
-                # units is 15% of body height on a 1-unit-tall character,
-                # making bake rays from the chest reach the back and bleed
-                # texture across unrelated surfaces. 2% of the bounding box
-                # diagonal comfortably covers the low/high-poly surface
-                # distance at any object scale.
-                bake_cage_extrusion = new_object.dimensions.length * 0.02
-
-                # Bake Normal Map
-                if normal_enabled and normal_texture_node:
-                    self._report_progress(context, 0.65, "Baking normal map...")
-                    for node in nodes:
-                        node.select = False
-                    normal_texture_node.select = True
-                    nodes.active = normal_texture_node
-                    
-                    # Explicitly pass selected-to-active settings into the operator
-                    bpy.ops.object.bake(
-                        type='NORMAL',
-                        use_clear=True,
-                        normal_space='TANGENT',
-                        use_selected_to_active=True,
-                        cage_extrusion=bake_cage_extrusion
-                    )
-                    
-                    normal_image.filepath_raw = os.path.join(bakeFolder, f"{normal_image_name}.png")
-                    normal_image.file_format = 'PNG'
-                    normal_image.save()
-
-                # Bake Diffuse Map
-                if diffuse_enabled and diffuse_node:
-                    self._report_progress(context, 0.85, "Baking diffuse map...")
-                    bpy.context.scene.render.bake.use_pass_direct = False
-                    bpy.context.scene.render.bake.use_pass_indirect = False
-                    bpy.context.scene.render.bake.use_pass_color = True
-                    
-                    for node in nodes:
-                        node.select = False
-                    diffuse_node.select = True
-                    nodes.active = diffuse_node
-                    
-                    # Explicitly pass selected-to-active settings into the operator
-                    bpy.ops.object.bake(
-                        type='DIFFUSE',
-                        use_clear=True,
-                        use_selected_to_active=True,
-                        cage_extrusion=bake_cage_extrusion
-                    )
-                    
-                    diffuse_image.filepath_raw = os.path.join(bakeFolder, f"{diffuse_image_name}.png")
-                    diffuse_image.file_format = 'PNG'
-                    diffuse_image.save()
-
-                # Link up the texture nodes to the shader after baking is complete
-                self._report_progress(context, 0.97, "Linking textures...")
-                if normal_enabled and normal_texture_node and norm_map and bsdf_node:
-                    links.new(normal_texture_node.outputs['Color'], norm_map.inputs['Color'])
-                    links.new(norm_map.outputs['Normal'], bsdf_node.inputs['Normal'])
-
-                if diffuse_enabled and diffuse_node and bsdf_node:
-                    links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Base Color'])
-
-            except Exception as e:
-                self._report_progress(context, context.scene.retopo_progress, f"Failed: {e}")
-                self.report({'ERROR'}, f"Error transferring detail to {original_obj_name}: {e}")
-                return {'CANCELLED'}
+        # Creating the new target material. Start from a copy of
+        # the original mesh's material rather than a blank one, so
+        # settings the bake doesn't cover (Roughness, Metallic,
+        # Specular, Emission, any extra texture maps) carry over
+        # instead of resetting to Blender's defaults. Base Color
+        # and Normal get overridden below with the freshly baked
+        # textures, since those need to match the new UV layout.
+        self._report_progress(context, 0.6, "Setting up material...")
+        yield
+        original_material = original_obj.data.materials[0] if original_obj.data.materials else None
+        if original_material:
+            material = original_material.copy()
+            material.name = f"{new_object_name}_Mat"
+            if not material.use_nodes:
+                material.use_nodes = True
         else:
-            self.report({'ERROR'}, "Active object is not a valid mesh.")
-            return {'CANCELLED'}
+            material = bpy.data.materials.new(name=f"{new_object_name}_Mat")
+            material.use_nodes = True
+        nodes = material.node_tree.nodes
+        links = material.node_tree.links
+        bsdf_node = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+        diffuse_node = None
+        normal_texture_node = None
+        norm_map = None
+
+        # Setup nodes based on settings
+        if bsdf_node:
+            if diffuse_enabled:
+                diffuse_image_name = f"{new_object_name}_Diffuse"
+                diffuse_image = bpy.data.images.new(name=diffuse_image_name, width=tex_size, height=tex_size, alpha=True)
+                diffuse_node = nodes.new(type='ShaderNodeTexImage')
+                diffuse_node.image = diffuse_image
+                diffuse_node.location = (-400, 400)
+
+            if normal_enabled:
+                normal_image_name = f"{new_object_name}_Normal"
+                normal_image = bpy.data.images.new(name=normal_image_name, width=tex_size, height=tex_size, alpha=False, float_buffer=True)
+                normal_image.colorspace_settings.name = 'Non-Color'
+                normal_texture_node = nodes.new(type='ShaderNodeTexImage')
+                normal_texture_node.image = normal_image
+                normal_texture_node.interpolation = 'Closest'
+                normal_texture_node.location = (-400, 200)
+
+                norm_map = nodes.new('ShaderNodeNormalMap')
+                norm_map.location = (-100, 0)
+
+        # Assign the material to the low-poly object
+        if len(new_object.data.materials) > 0:
+            new_object.data.materials[0] = material
+        else:
+            new_object.data.materials.append(material)
+
+        # Set up Selected-to-Active baking selections
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.data.objects[original_obj_name].select_set(True)  # Select source high-poly (Selected)
+        bpy.data.objects[new_object_name].select_set(True)     # Select target low-poly (Active)
+        bpy.context.view_layer.objects.active = bpy.data.objects[new_object_name]
+
+        # Common Bake Engine Settings
+        bpy.context.scene.render.bake.use_multires = False
+        bpy.context.scene.cycles.tile_size = 512
+        bpy.context.scene.cycles.samples = 10
+
+        # Cage extrusion must scale with the object: a fixed 0.15
+        # units is 15% of body height on a 1-unit-tall character,
+        # making bake rays from the chest reach the back and bleed
+        # texture across unrelated surfaces. 2% of the bounding box
+        # diagonal comfortably covers the low/high-poly surface
+        # distance at any object scale.
+        bake_cage_extrusion = new_object.dimensions.length * 0.02
+
+        # Bake Normal Map
+        if normal_enabled and normal_texture_node:
+            self._report_progress(context, 0.65, "Baking normal map...")
+            yield
+            for node in nodes:
+                node.select = False
+            normal_texture_node.select = True
+            nodes.active = normal_texture_node
+
+            # Explicitly pass selected-to-active settings into the operator
+            bpy.ops.object.bake(
+                type='NORMAL',
+                use_clear=True,
+                normal_space='TANGENT',
+                use_selected_to_active=True,
+                cage_extrusion=bake_cage_extrusion
+            )
+
+            normal_image.filepath_raw = os.path.join(bakeFolder, f"{normal_image_name}.png")
+            normal_image.file_format = 'PNG'
+            normal_image.save()
+
+        # Bake Diffuse Map
+        if diffuse_enabled and diffuse_node:
+            self._report_progress(context, 0.85, "Baking diffuse map...")
+            yield
+            bpy.context.scene.render.bake.use_pass_direct = False
+            bpy.context.scene.render.bake.use_pass_indirect = False
+            bpy.context.scene.render.bake.use_pass_color = True
+
+            for node in nodes:
+                node.select = False
+            diffuse_node.select = True
+            nodes.active = diffuse_node
+
+            # Explicitly pass selected-to-active settings into the operator
+            bpy.ops.object.bake(
+                type='DIFFUSE',
+                use_clear=True,
+                use_selected_to_active=True,
+                cage_extrusion=bake_cage_extrusion
+            )
+
+            diffuse_image.filepath_raw = os.path.join(bakeFolder, f"{diffuse_image_name}.png")
+            diffuse_image.file_format = 'PNG'
+            diffuse_image.save()
+
+        # Link up the texture nodes to the shader after baking is complete
+        self._report_progress(context, 0.97, "Linking textures...")
+        yield
+        if normal_enabled and normal_texture_node and norm_map and bsdf_node:
+            links.new(normal_texture_node.outputs['Color'], norm_map.inputs['Color'])
+            links.new(norm_map.outputs['Normal'], bsdf_node.inputs['Normal'])
+
+        if diffuse_enabled and diffuse_node and bsdf_node:
+            links.new(diffuse_node.outputs['Color'], bsdf_node.inputs['Base Color'])
 
         self._report_progress(context, 1.0, "Completed")
         self.report({'INFO'}, "Remesh and texture transfer completed successfully")
-        return {'FINISHED'}
+
+    def _cleanup(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if self._gen is not None:
+            # Explicitly close rather than just dropping the reference:
+            # the generator's frame holds a reference to self (a bound
+            # method), and self._gen references the generator back, so
+            # simple refcounting won't collect it promptly. Closing it
+            # here raises GeneratorExit at wherever it's suspended,
+            # running the scale-restoration finally block immediately -
+            # important on cancel, where it would otherwise be left at
+            # 1/10 scale until the cycle collector eventually got to it.
+            self._gen.close()
+            self._gen = None
+
+    def _advance(self, context):
+        """Advance the generator by one step. Returns 'FINISHED',
+        'CANCELLED', or None (meaning: more steps remain)."""
+        try:
+            next(self._gen)
+            return None
+        except StopIteration:
+            return {'FINISHED'}
+        except Exception as e:
+            name = self._original_obj_name or "object"
+            self._report_progress(context, context.scene.retopo_progress, f"Failed: {e}")
+            self.report({'ERROR'}, f"Error transferring detail to {name}: {e}")
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        self._gen = self._process(context)
+
+        if not context.window:
+            # No window (background/headless script call) - a modal
+            # timer has nothing to attach to, so just run the whole
+            # pipeline synchronously like the old blocking execute().
+            return self._run_to_completion(context)
+
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'ESC'}:
+            self._cleanup(context)
+            self._report_progress(context, context.scene.retopo_progress, "Cancelled")
+            self.report({'WARNING'}, "Remesh cancelled")
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            result = self._advance(context)
+            if result is not None:
+                self._cleanup(context)
+                return result
+
+        return {'PASS_THROUGH'}
+
+    def _run_to_completion(self, context):
+        while True:
+            result = self._advance(context)
+            if result is not None:
+                self._cleanup(context)
+                return result
+
+    def execute(self, context):
+        # Direct execute() call (scripts, macros, background mode) -
+        # no modal loop, just drain the generator in one blocking pass
+        # exactly like before.
+        self._gen = self._process(context)
+        return self._run_to_completion(context)
